@@ -1,0 +1,166 @@
+"""
+Audit qualite des donnees OCTOPOS (version CSV locale).
+
+Lit tous les CSV du dossier data/, et pour chaque table detecte :
+  - lignes dupliquees
+  - valeurs nulles / vides par colonne
+  - types incoherents (colonnes qui melangent plusieurs formats)
+  - dates mal formees (colonnes dont le nom ressemble a une date)
+
+Usage :
+    python audit_quality.py
+
+Sortie :
+    audit_qualite.csv          -> resume par table
+    audit_qualite_detail.txt   -> detail par colonne
+"""
+import pandas as pd
+import numpy as np
+import re
+import os
+
+DATA_DIR = "data"
+REPORT_CSV = "audit_qualite.csv"
+REPORT_TXT = "audit_qualite_detail.txt"
+
+DATE_HINTS = ("At", "Date", "date", "closedAt", "openedAt", "dlc", "hireDate", "probationEnd")
+
+DATE_PATTERNS = [
+    r"^\d{4}-\d{2}-\d{2}$",
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}",
+    r"^\d{2}/\d{2}/\d{4}$",
+]
+DATE_RE_LIST = [re.compile(p) for p in DATE_PATTERNS]
+
+NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
+BOOL_VALUES = {"t", "f", "true", "false", "0", "1"}
+
+
+def looks_like_date(value: str) -> bool:
+    return any(r.match(value) for r in DATE_RE_LIST)
+
+
+def classify_value(v):
+    s = str(v).strip()
+    if s in BOOL_VALUES:
+        return "boolean"
+    if NUMERIC_RE.match(s):
+        return "numeric"
+    if looks_like_date(s):
+        return "date"
+    return "text"
+
+
+def audit_column(series: pd.Series, colname: str):
+    n_total = len(series)
+    s = series.astype(object)
+
+    is_null = s.apply(lambda v: v is None or (isinstance(v, str) and v.strip() in ("", "\\N", "None", "nan")) or (isinstance(v, float) and pd.isna(v)))
+    n_null = is_null.sum()
+    pct_null = round(100 * n_null / n_total, 1) if n_total else 0
+
+    non_null_vals = s[~is_null]
+
+    types_seen = non_null_vals.apply(classify_value)
+    type_counts = types_seen.value_counts().to_dict()
+    n_types = len(type_counts)
+
+    inconsistent_type = n_types > 1 and not (
+        n_types == 2 and "boolean" in type_counts and min(type_counts.values()) / n_total < 0.02
+    )
+
+    malformed_dates = 0
+    malformed_examples = []
+    if any(h in colname for h in DATE_HINTS):
+        for v in non_null_vals:
+            sv = str(v).strip()
+            if not looks_like_date(sv):
+                malformed_dates += 1
+                if len(malformed_examples) < 3:
+                    malformed_examples.append(sv)
+
+    return {
+        "colonne": colname,
+        "n_null": int(n_null),
+        "pct_null": pct_null,
+        "types_rencontres": type_counts,
+        "type_incoherent": inconsistent_type,
+        "dates_mal_formees": malformed_dates,
+        "exemples_dates_mal_formees": malformed_examples,
+    }
+
+
+def audit_table(df: pd.DataFrame, tname: str):
+    n_rows = len(df)
+    n_dup_full = int(df.duplicated().sum())
+
+    n_dup_id = None
+    if "id" in df.columns:
+        n_dup_id = int(df["id"].duplicated().sum())
+
+    col_reports = [audit_column(df[c], c) for c in df.columns]
+
+    n_cols_with_nulls = sum(1 for c in col_reports if c["n_null"] > 0)
+    n_cols_inconsistent = sum(1 for c in col_reports if c["type_incoherent"])
+    n_cols_bad_dates = sum(1 for c in col_reports if c["dates_mal_formees"] > 0)
+
+    summary = {
+        "table": tname,
+        "lignes": n_rows,
+        "colonnes": len(df.columns),
+        "doublons_complets": n_dup_full,
+        "doublons_id": n_dup_id if n_dup_id is not None else "N/A",
+        "colonnes_avec_nulls": n_cols_with_nulls,
+        "colonnes_type_incoherent": n_cols_inconsistent,
+        "colonnes_dates_mal_formees": n_cols_bad_dates,
+    }
+    return summary, col_reports
+
+
+def main():
+    if not os.path.isdir(DATA_DIR):
+        print(f"Dossier '{DATA_DIR}' introuvable. Verifie que tu lances le script depuis octopos_project/.")
+        return
+
+    csv_files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".csv"))
+    if not csv_files:
+        print(f"Aucun fichier CSV trouve dans '{DATA_DIR}/'.")
+        return
+
+    summaries = []
+    detail_lines = []
+
+    for fname in csv_files:
+        tname = fname[:-4]
+        path = os.path.join(DATA_DIR, fname)
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+
+        summary, col_reports = audit_table(df, tname)
+        summaries.append(summary)
+
+        detail_lines.append(f"\n{'='*70}\nTABLE: {tname} ({summary['lignes']} lignes)\n{'='*70}")
+        for cr in col_reports:
+            if cr["n_null"] > 0 or cr["type_incoherent"] or cr["dates_mal_formees"] > 0:
+                detail_lines.append(f"  - {cr['colonne']}:")
+                if cr["n_null"] > 0:
+                    detail_lines.append(f"      nulls: {cr['n_null']} ({cr['pct_null']}%)")
+                if cr["type_incoherent"]:
+                    detail_lines.append(f"      types melanges: {cr['types_rencontres']}")
+                if cr["dates_mal_formees"] > 0:
+                    detail_lines.append(f"      dates mal formees: {cr['dates_mal_formees']} -> ex: {cr['exemples_dates_mal_formees']}")
+
+        print(f"{tname}: {summary['lignes']} lignes | doublons={summary['doublons_complets']} | "
+              f"cols avec nulls={summary['colonnes_avec_nulls']} | "
+              f"cols incoherentes={summary['colonnes_type_incoherent']} | "
+              f"cols dates KO={summary['colonnes_dates_mal_formees']}")
+
+    pd.DataFrame(summaries).to_csv(REPORT_CSV, index=False)
+    with open(REPORT_TXT, "w", encoding="utf-8") as f:
+        f.write("\n".join(detail_lines))
+
+    print(f"\nRapport resume : {REPORT_CSV}")
+    print(f"Rapport detaille : {REPORT_TXT}")
+
+
+if __name__ == "__main__":
+    main()
