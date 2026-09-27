@@ -4,7 +4,7 @@ Projet Data Analysis avec Python, Pandas, Matplotlib
 
 ## Ce que j'ai fait:
 - Généré 1000 étudiants (3 matières: Anglais, Info, Math)
-- Nettoyé 8% de données manquantes avec `fillna + groupby`
+- Nettoyé 8% de données manquantes avec fillna + groupby
 - Analysé: 682 réussites vs 318 échecs
 - Visualisé moyenne par matière
 
